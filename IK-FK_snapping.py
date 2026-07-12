@@ -11,7 +11,7 @@ bl_info = {
     'blender': (3, 1, 0),
     'category': 'Animation',
     # optional
-    'version': (2, 0, 0),
+    'version': (2, 1, 0),
     'author': 'Byron Mallett',
     'description': 'Custom rig FK/IK snapping tools',
 }
@@ -83,6 +83,31 @@ def rest_pole_angle(root_bone, chain_tip, pole_pos):
     return -signed_angle(x_axis, projected, bone_dir)
 
 
+def capture_rotation(pbone):
+    if pbone.rotation_mode == 'QUATERNION':
+        return pbone.rotation_quaternion.copy()
+    if pbone.rotation_mode == 'AXIS_ANGLE':
+        return None
+    return pbone.rotation_euler.copy()
+
+
+def apply_compatible_rotation(pbone, prev):
+    """Re-express the bone's rotation so it interpolates the short way from
+    prev (quaternion hemisphere / euler cycle fix). The pose itself is unchanged."""
+    if prev is None:
+        return
+    if pbone.rotation_mode == 'QUATERNION':
+        q = pbone.rotation_quaternion
+        if q.dot(prev) < 0:
+            q = q.copy()
+            q.negate()
+            pbone.rotation_quaternion = q
+    elif pbone.rotation_mode != 'AXIS_ANGLE':
+        e = pbone.rotation_euler.copy()
+        e.make_compatible(prev)
+        pbone.rotation_euler = e
+
+
 def keyframe_snapped_bone(pbone, frame):
     pbone.keyframe_insert('location', frame=frame)
     if pbone.rotation_mode == 'QUATERNION':
@@ -93,9 +118,25 @@ def keyframe_snapped_bone(pbone, frame):
         pbone.keyframe_insert('rotation_euler', frame=frame)
 
 
+def keyframe_existing_channels(pbone, frame, channels=('location', 'scale')):
+    """Key only channels that already have fcurves, so an existing animation on
+    the bone cannot snap it back, without creating new channels on clean rigs."""
+    anim = pbone.id_data.animation_data
+    action = anim.action if anim else None
+    if action is None:
+        return
+    existing = {fc.data_path for fc in action_fcurves(action)}
+    for channel in channels:
+        if pbone.path_from_id(channel) in existing:
+            pbone.keyframe_insert(channel, frame=frame)
+
+
 class SnapOperatorBase:
     required_fields = ()
     keyed_fields = ()
+    # Fields whose bones the snap re-aligns to cancel stray animation; their
+    # already-animated location/scale channels get re-keyed to hold the fix
+    aligned_fields = ()
 
     @classmethod
     def poll(cls, context):
@@ -125,19 +166,32 @@ class SnapOperatorBase:
                 return {'CANCELLED'}
             deviation = 0.0
             original_frame = scene.frame_current
+            prev_rots = {}
             for frame in range(scene.fkik_start_frame, scene.fkik_end_frame + 1):
                 scene.frame_set(frame)
+                for field in self.keyed_fields:
+                    if field not in prev_rots:
+                        prev_rots[field] = capture_rotation(bones[field])
                 deviation = max(deviation, self.snap(context, bones))
                 for field in self.keyed_fields:
+                    apply_compatible_rotation(bones[field], prev_rots[field])
+                    prev_rots[field] = capture_rotation(bones[field])
                     keyframe_snapped_bone(bones[field], frame)
+                for field in self.aligned_fields:
+                    keyframe_existing_channels(bones[field], frame)
             scene.frame_set(original_frame)
         else:
             # No frame_set here: it re-evaluates animation, which would wipe
             # both the user's unkeyed pose and the snap result on keyed bones
+            prev_rots = {f: capture_rotation(bones[f]) for f in self.keyed_fields}
             deviation = self.snap(context, bones)
+            for field in self.keyed_fields:
+                apply_compatible_rotation(bones[field], prev_rots[field])
             if scene.tool_settings.use_keyframe_insert_auto:
                 for field in self.keyed_fields:
                     keyframe_snapped_bone(bones[field], scene.frame_current)
+                for field in self.aligned_fields:
+                    keyframe_existing_channels(bones[field], scene.frame_current)
 
         # Verify the snapped chains actually landed on each other
         chain_len = bones['fk_upper'].length + bones['fk_lower'].length
@@ -166,6 +220,7 @@ class FKIK_OT_snap_ik_to_fk(SnapOperatorBase, bpy.types.Operator):
     required_fields = ('fk_upper', 'fk_lower', 'fk_end', 'ik_upper', 'ik_lower',
                        'ik_target', 'ik_pole')
     keyed_fields = ('ik_target', 'ik_pole')
+    aligned_fields = ('ik_upper', 'ik_lower')
 
     def snap(self, context, bones):
         fk_upper = bones['fk_upper']
@@ -175,6 +230,15 @@ class FKIK_OT_snap_ik_to_fk(SnapOperatorBase, bpy.types.Operator):
         ik_lower = bones['ik_lower']
         ik_target = bones['ik_target']
         ik_pole = bones['ik_pole']
+
+        # Align the IK chain onto the FK chain first. The IK solver only drives
+        # rotations, so stray location/scale keys on the chain bones (e.g. from
+        # whole-character keying) displace the chain root and would make an
+        # exact match impossible
+        ik_upper.matrix = fk_upper.matrix
+        context.view_layer.update()
+        ik_lower.matrix = fk_lower.matrix
+        context.view_layer.update()
 
         # Set IK target matrix relative to the original FK end bone in armature space
         target_offset = fk_end.bone.matrix_local.inverted() @ ik_target.bone.matrix_local
@@ -375,6 +439,97 @@ class FKIK_OT_calibrate_pole_angle(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def action_fcurves(action):
+    """All fcurves of an action, covering both legacy and slotted actions."""
+    try:
+        fcurves = list(action.fcurves)
+        if fcurves:
+            return fcurves
+    except AttributeError:
+        pass
+    fcurves = []
+    for layer in action.layers:
+        for strip in layer.strips:
+            for slot in action.slots:
+                channelbag = strip.channelbag(slot)
+                if channelbag:
+                    fcurves.extend(channelbag.fcurves)
+    return fcurves
+
+
+class FKIK_OT_fix_rotation_flips(bpy.types.Operator):
+    bl_idname = 'fkik.fix_rotation_flips'
+    bl_label = 'Fix Rotation Flips'
+    bl_description = (
+        "Remove quaternion sign flips from the limb armature's action - keyframes "
+        "that store the same pose with opposite sign make the bone spin the long "
+        "way around between keys"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        limb = get_active_limb(context.scene)
+        return (limb is not None and limb.armature is not None
+                and limb.armature.animation_data is not None
+                and limb.armature.animation_data.action is not None)
+
+    def execute(self, context):
+        limb = get_active_limb(context.scene)
+        action = limb.armature.animation_data.action
+
+        quat_channels = {}
+        for fc in action_fcurves(action):
+            if fc.data_path.endswith('.rotation_quaternion') and fc.array_index < 4:
+                quat_channels.setdefault(fc.data_path, {})[fc.array_index] = fc
+
+        fixed = 0
+        skipped = []
+        for path, comps in quat_channels.items():
+            key_rows = [comps[i].keyframe_points for i in range(4) if i in comps]
+            aligned = (
+                len(comps) == 4
+                and len({len(rows) for rows in key_rows}) == 1
+                and all(
+                    max(rows[idx].co[0] for rows in key_rows)
+                    - min(rows[idx].co[0] for rows in key_rows) <= 1e-3
+                    for idx in range(len(key_rows[0]))
+                )
+            )
+            if not aligned:
+                skipped.append(path)
+                continue
+
+            prev = None
+            changed = False
+            for idx in range(len(key_rows[0])):
+                quat = [rows[idx].co[1] for rows in key_rows]
+                if prev is not None and sum(a * b for a, b in zip(prev, quat)) < 0:
+                    for rows in key_rows:
+                        kp = rows[idx]
+                        kp.co[1] = -kp.co[1]
+                        kp.handle_left[1] = -kp.handle_left[1]
+                        kp.handle_right[1] = -kp.handle_right[1]
+                    quat = [-v for v in quat]
+                    fixed += 1
+                    changed = True
+                prev = quat
+            if changed:
+                for i in range(4):
+                    comps[i].update()
+
+        if skipped:
+            self.report(
+                {'WARNING'},
+                'Fixed %d flipped key(s); skipped %d channel(s) with mismatched '
+                'keyframes: %s' % (fixed, len(skipped), ', '.join(skipped)),
+            )
+        else:
+            self.report({'INFO'}, "Fixed %d flipped key(s) in action '%s'" % (fixed, action.name))
+        context.view_layer.update()
+        return {'FINISHED'}
+
+
 class FKIK_OT_limb_add(bpy.types.Operator):
     bl_idname = 'fkik.limb_add'
     bl_label = 'Add Limb'
@@ -484,6 +639,8 @@ class FKIKSnapPanel(bpy.types.Panel):
         col.label(text=limb.name)
         col.operator('fkik.snap_ik_to_fk', text='Snap IK to FK')
         col.operator('fkik.snap_fk_to_ik', text='Snap FK to IK')
+        col.separator()
+        col.operator('fkik.fix_rotation_flips', icon='FCURVE')
 
 
 class FKIKMappingPanel(bpy.types.Panel):
@@ -542,6 +699,7 @@ CLASSES = [
     FKIK_OT_snap_ik_to_fk,
     FKIK_OT_snap_fk_to_ik,
     FKIK_OT_calibrate_pole_angle,
+    FKIK_OT_fix_rotation_flips,
     FKIK_OT_add_limb_preset,
     FKIK_PT_presets,
     FKIK_MT_limb_presets,
