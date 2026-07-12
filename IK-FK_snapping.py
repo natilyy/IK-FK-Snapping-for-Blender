@@ -78,7 +78,9 @@ def rest_pole_angle(root_bone, chain_tip, pole_pos):
     projected = pole_normal.cross(bone_dir)
     if projected.length_squared < 1e-12:
         return None
-    return signed_angle(x_axis, projected, bone_dir)
+    # Negated: Blender's pole_angle convention runs opposite to the
+    # right-handed angle around the bone direction
+    return -signed_angle(x_axis, projected, bone_dir)
 
 
 def keyframe_snapped_bone(pbone, frame):
@@ -268,6 +270,17 @@ class FKIK_OT_calibrate_pole_angle(bpy.types.Operator):
     )
     bl_options = {'REGISTER', 'UNDO'}
 
+    aim_at_pole: bpy.props.BoolProperty(
+        name='Aim bend at pole',
+        description=(
+            'Rotate the bend plane so the knee/elbow points exactly at the pole '
+            'target instead of exactly reproducing the rest pose. Use when the pole '
+            'target does not sit in the rest bend plane of the chain - note the '
+            'chain will then twist slightly away from its rest pose'
+        ),
+        default=False,
+    )
+
     @classmethod
     def poll(cls, context):
         return get_active_limb(context.scene) is not None
@@ -329,13 +342,35 @@ class FKIK_OT_calibrate_pole_angle(bpy.types.Operator):
             self.report({'ERROR'}, 'Pole target lies on the IK chain axis; move it off to the side')
             return {'CANCELLED'}
 
+        # How far the pole sits out of the chain's rest bend plane, measured
+        # around the root->tip axis. Adding it aims the bend at the pole.
+        hip = Vector(root.bone.head_local)
+        chord = Vector(owner.bone.tail_local) - hip
+        pre_bend = Vector(owner.bone.head_local) - hip
+        pre_bend = pre_bend - pre_bend.project(chord)
+        pole_perp = pole_pos - hip
+        pole_perp = pole_perp - pole_perp.project(chord)
+        misalign = None
+        if pre_bend.length_squared > 1e-12 and pole_perp.length_squared > 1e-12:
+            misalign = signed_angle(pre_bend, pole_perp, chord)
+
+        if self.aim_at_pole:
+            if misalign is None:
+                self.report({'ERROR'}, 'Chain is dead straight at rest; cannot measure its bend direction')
+                return {'CANCELLED'}
+            angle += misalign
+
         old_angle = con.pole_angle
         con.pole_angle = angle
         context.view_layer.update()
+        note = ''
+        if misalign is not None and abs(misalign) > math.radians(2.0):
+            note = (" | pole target sits %.1f° out of the chain's rest bend plane"
+                    % math.degrees(misalign))
         self.report(
             {'INFO'},
-            "Pole angle on '%s' constraint '%s': %.1f° -> %.1f°"
-            % (owner.name, con.name, math.degrees(old_angle), math.degrees(angle)),
+            "Pole angle on '%s' constraint '%s': %.1f° -> %.1f°%s"
+            % (owner.name, con.name, math.degrees(old_angle), math.degrees(angle), note),
         )
         return {'FINISHED'}
 
