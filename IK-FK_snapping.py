@@ -1,3 +1,5 @@
+import math
+
 import bpy
 from mathutils import Matrix, Vector
 from bl_ui.utils import PresetPanel
@@ -59,6 +61,26 @@ def resolve_bones(limb, fields):
     return bones, missing
 
 
+def signed_angle(vector_u, vector_v, axis):
+    angle = vector_u.angle(vector_v)
+    if vector_u.cross(vector_v).dot(axis) < 0:
+        angle = -angle
+    return angle
+
+
+def rest_pole_angle(root_bone, chain_tip, pole_pos):
+    """Pole angle that makes the IK solve reproduce the rest pose exactly,
+    for a pole at pole_pos (armature space). Same construction Rigify uses."""
+    base_head = Vector(root_bone.head_local)
+    x_axis = root_bone.matrix_local.to_3x3().col[0]
+    bone_dir = Vector(root_bone.tail_local) - base_head
+    pole_normal = (Vector(chain_tip) - base_head).cross(pole_pos - base_head)
+    projected = pole_normal.cross(bone_dir)
+    if projected.length_squared < 1e-12:
+        return None
+    return signed_angle(x_axis, projected, bone_dir)
+
+
 def keyframe_snapped_bone(pbone, frame):
     pbone.keyframe_insert('location', frame=frame)
     if pbone.rotation_mode == 'QUATERNION':
@@ -99,22 +121,37 @@ class SnapOperatorBase:
             if scene.fkik_start_frame > scene.fkik_end_frame:
                 self.report({'ERROR'}, 'Start frame must not be after end frame')
                 return {'CANCELLED'}
+            deviation = 0.0
             original_frame = scene.frame_current
             for frame in range(scene.fkik_start_frame, scene.fkik_end_frame + 1):
                 scene.frame_set(frame)
-                self.snap(context, bones)
+                deviation = max(deviation, self.snap(context, bones))
                 for field in self.keyed_fields:
                     keyframe_snapped_bone(bones[field], frame)
             scene.frame_set(original_frame)
         else:
             # No frame_set here: it re-evaluates animation, which would wipe
             # both the user's unkeyed pose and the snap result on keyed bones
-            self.snap(context, bones)
+            deviation = self.snap(context, bones)
             if scene.tool_settings.use_keyframe_insert_auto:
                 for field in self.keyed_fields:
                     keyframe_snapped_bone(bones[field], scene.frame_current)
 
-        self.report({'INFO'}, "%s: limb '%s'" % (self.bl_label, limb.name))
+        # Verify the snapped chains actually landed on each other
+        chain_len = bones['fk_upper'].length + bones['fk_lower'].length
+        if deviation > 0.01 * chain_len:
+            self.report(
+                {'WARNING'},
+                "%s: limb '%s' snapped, but chains still deviate by %.4f - check that the "
+                "FK and IK chains share the same rest joint positions and bone lengths, "
+                "and that no locks or extra constraints interfere"
+                % (self.bl_label, limb.name, deviation),
+            )
+        else:
+            self.report(
+                {'INFO'},
+                "%s: limb '%s' (residual %.5f)" % (self.bl_label, limb.name, deviation),
+            )
         return {'FINISHED'}
 
 
@@ -124,13 +161,16 @@ class FKIK_OT_snap_ik_to_fk(SnapOperatorBase, bpy.types.Operator):
     bl_description = 'Move the IK target and pole so the IK chain matches the current FK pose'
     bl_options = {'REGISTER', 'UNDO'}
 
-    required_fields = ('fk_upper', 'fk_lower', 'fk_end', 'ik_target', 'ik_pole')
+    required_fields = ('fk_upper', 'fk_lower', 'fk_end', 'ik_upper', 'ik_lower',
+                       'ik_target', 'ik_pole')
     keyed_fields = ('ik_target', 'ik_pole')
 
     def snap(self, context, bones):
         fk_upper = bones['fk_upper']
         fk_lower = bones['fk_lower']
         fk_end = bones['fk_end']
+        ik_upper = bones['ik_upper']
+        ik_lower = bones['ik_lower']
         ik_target = bones['ik_target']
         ik_pole = bones['ik_pole']
 
@@ -153,12 +193,37 @@ class FKIK_OT_snap_ik_to_fk(SnapOperatorBase, bpy.types.Operator):
         if pole_dir.length_squared < 1e-12:
             # Limb is straight: keep the pole on its current side of the chain
             pole_dir = ik_pole.matrix.translation - elbow
-        if pole_dir.length_squared < 1e-12:
-            return
+        if pole_dir.length_squared > 1e-12:
+            pole_loc = elbow + pole_dir.normalized() * (fk_upper.length + fk_lower.length)
+            ik_pole.matrix = Matrix.LocRotScale(pole_loc, ik_pole.matrix.to_quaternion(), None)
+            context.view_layer.update()
 
-        pole_loc = elbow + pole_dir.normalized() * (fk_upper.length + fk_lower.length)
-        ik_pole.matrix = Matrix.LocRotScale(pole_loc, ik_pole.matrix.to_quaternion(), None)
-        context.view_layer.update()
+        # Closed-loop correction: measure how far the solved IK knee/elbow sits
+        # rotated around the root->tip axis from the FK one, and rotate the pole
+        # to cancel it. Makes the snap exact even if the rig's pole angle is off.
+        for _ in range(3):
+            root = ik_upper.matrix.translation
+            axis = (ik_lower.matrix.translation + ik_lower.vector) - root
+            if axis.length_squared < 1e-12:
+                break
+            axis.normalize()
+            v_ik = ik_lower.matrix.translation - root
+            v_fk = fk_lower.matrix.translation - fk_upper.matrix.translation
+            v_ik = v_ik - v_ik.project(axis)
+            v_fk = v_fk - v_fk.project(axis)
+            if v_ik.length_squared < 1e-12 or v_fk.length_squared < 1e-12:
+                break
+            angle = signed_angle(v_ik, v_fk, axis)
+            if abs(angle) < 1e-6:
+                break
+            pole_loc = root + Matrix.Rotation(angle, 3, axis) @ (ik_pole.matrix.translation - root)
+            ik_pole.matrix = Matrix.LocRotScale(pole_loc, ik_pole.matrix.to_quaternion(), None)
+            context.view_layer.update()
+
+        knee_err = (ik_lower.matrix.translation - fk_lower.matrix.translation).length
+        tip_err = ((ik_lower.matrix.translation + ik_lower.vector)
+                   - (fk_lower.matrix.translation + fk_lower.vector)).length
+        return max(knee_err, tip_err)
 
 
 class FKIK_OT_snap_fk_to_ik(SnapOperatorBase, bpy.types.Operator):
@@ -181,6 +246,98 @@ class FKIK_OT_snap_fk_to_ik(SnapOperatorBase, bpy.types.Operator):
         end_offset = bones['ik_end'].bone.matrix_local.inverted() @ bones['fk_end'].bone.matrix_local
         bones['fk_end'].matrix = bones['ik_end'].matrix @ end_offset
         context.view_layer.update()
+
+        deviation = 0.0
+        for fk_field, ik_field in (('fk_upper', 'ik_upper'), ('fk_lower', 'ik_lower')):
+            fk_b, ik_b = bones[fk_field], bones[ik_field]
+            deviation = max(
+                deviation,
+                (fk_b.matrix.translation - ik_b.matrix.translation).length,
+                ((fk_b.matrix.translation + fk_b.vector)
+                 - (ik_b.matrix.translation + ik_b.vector)).length,
+            )
+        return deviation
+
+
+class FKIK_OT_calibrate_pole_angle(bpy.types.Operator):
+    bl_idname = 'fkik.calibrate_pole_angle'
+    bl_label = 'Fix Pole Angle'
+    bl_description = (
+        "Set the IK constraint's pole angle so the IK chain exactly reproduces its "
+        "rest pose (fixes knees/elbows that drift sideways as the limb bends)"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return get_active_limb(context.scene) is not None
+
+    def execute(self, context):
+        limb = get_active_limb(context.scene)
+        if limb.armature is None or limb.armature.type != 'ARMATURE':
+            self.report({'ERROR'}, "Limb '%s' has no armature assigned" % limb.name)
+            return {'CANCELLED'}
+
+        # Find the IK constraint on the limb's IK chain
+        con = None
+        owner = None
+        for field in ('ik_lower', 'ik_end', 'ik_upper'):
+            bone_name = getattr(limb, field)
+            pbone = limb.armature.pose.bones.get(bone_name) if bone_name else None
+            if pbone is None:
+                continue
+            for c in pbone.constraints:
+                if c.type == 'IK':
+                    con, owner = c, pbone
+                    break
+            if con is not None:
+                break
+        if con is None:
+            self.report({'ERROR'}, "No IK constraint found on the limb's IK bones")
+            return {'CANCELLED'}
+        if con.pole_target is None:
+            self.report({'ERROR'}, "IK constraint '%s' has no pole target" % con.name)
+            return {'CANCELLED'}
+
+        # Pole rest position in armature space
+        if con.pole_target == limb.armature and con.pole_subtarget:
+            pole_bone = limb.armature.data.bones.get(con.pole_subtarget)
+            if pole_bone is None:
+                self.report({'ERROR'}, "Pole subtarget '%s' not found" % con.pole_subtarget)
+                return {'CANCELLED'}
+            pole_pos = Vector(pole_bone.head_local)
+        else:
+            world = con.pole_target.matrix_world
+            if con.pole_subtarget and con.pole_target.type == 'ARMATURE':
+                bone = con.pole_target.data.bones.get(con.pole_subtarget)
+                if bone is None:
+                    self.report({'ERROR'}, "Pole subtarget '%s' not found" % con.pole_subtarget)
+                    return {'CANCELLED'}
+                world = world @ Matrix.Translation(bone.head_local)
+            pole_pos = limb.armature.matrix_world.inverted() @ world.translation
+
+        # Walk up from the constraint owner to the root of the IK chain
+        root = owner
+        steps = con.chain_count - 1 if con.chain_count > 0 else 255
+        for _ in range(steps):
+            if root.parent is None:
+                break
+            root = root.parent
+
+        angle = rest_pole_angle(root.bone, owner.bone.tail_local, pole_pos)
+        if angle is None:
+            self.report({'ERROR'}, 'Pole target lies on the IK chain axis; move it off to the side')
+            return {'CANCELLED'}
+
+        old_angle = con.pole_angle
+        con.pole_angle = angle
+        context.view_layer.update()
+        self.report(
+            {'INFO'},
+            "Pole angle on '%s' constraint '%s': %.1f° -> %.1f°"
+            % (owner.name, con.name, math.degrees(old_angle), math.degrees(angle)),
+        )
+        return {'FINISHED'}
 
 
 class FKIK_OT_limb_add(bpy.types.Operator):
@@ -338,6 +495,8 @@ class FKIKMappingPanel(bpy.types.Panel):
         col.label(text='IK controls:')
         col.prop_search(limb, 'ik_target', arma, 'bones')
         col.prop_search(limb, 'ik_pole', arma, 'bones')
+        col.separator()
+        col.operator('fkik.calibrate_pole_angle', icon='CON_KINEMATIC')
 
 
 CLASSES = [
@@ -347,6 +506,7 @@ CLASSES = [
     FKIK_OT_limb_remove,
     FKIK_OT_snap_ik_to_fk,
     FKIK_OT_snap_fk_to_ik,
+    FKIK_OT_calibrate_pole_angle,
     FKIK_OT_add_limb_preset,
     FKIK_PT_presets,
     FKIK_MT_limb_presets,
