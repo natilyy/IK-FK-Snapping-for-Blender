@@ -83,6 +83,12 @@ def rest_pole_angle(root_bone, chain_tip, pole_pos):
     return -signed_angle(x_axis, projected, bone_dir)
 
 
+def rotation_difference_deg(pbone_a, pbone_b):
+    q = (pbone_a.matrix.to_3x3().normalized()
+         @ pbone_b.matrix.to_3x3().normalized().inverted()).to_quaternion()
+    return math.degrees(2.0 * math.acos(min(1.0, abs(q.w))))
+
+
 def capture_rotation(pbone):
     if pbone.rotation_mode == 'QUATERNION':
         return pbone.rotation_quaternion.copy()
@@ -165,6 +171,7 @@ class SnapOperatorBase:
                 self.report({'ERROR'}, 'Start frame must not be after end frame')
                 return {'CANCELLED'}
             deviation = 0.0
+            twist = 0.0
             original_frame = scene.frame_current
             prev_rots = {}
             for frame in range(scene.fkik_start_frame, scene.fkik_end_frame + 1):
@@ -172,7 +179,9 @@ class SnapOperatorBase:
                 for field in self.keyed_fields:
                     if field not in prev_rots:
                         prev_rots[field] = capture_rotation(bones[field])
-                deviation = max(deviation, self.snap(context, bones))
+                frame_dev, frame_twist = self.snap(context, bones)
+                deviation = max(deviation, frame_dev)
+                twist = max(twist, frame_twist)
                 for field in self.keyed_fields:
                     apply_compatible_rotation(bones[field], prev_rots[field])
                     prev_rots[field] = capture_rotation(bones[field])
@@ -184,7 +193,7 @@ class SnapOperatorBase:
             # No frame_set here: it re-evaluates animation, which would wipe
             # both the user's unkeyed pose and the snap result on keyed bones
             prev_rots = {f: capture_rotation(bones[f]) for f in self.keyed_fields}
-            deviation = self.snap(context, bones)
+            deviation, twist = self.snap(context, bones)
             for field in self.keyed_fields:
                 apply_compatible_rotation(bones[field], prev_rots[field])
             if scene.tool_settings.use_keyframe_insert_auto:
@@ -203,10 +212,19 @@ class SnapOperatorBase:
                 "and that no locks or extra constraints interfere"
                 % (self.bl_label, limb.name, deviation),
             )
+        elif twist > 5.0:
+            self.report(
+                {'WARNING'},
+                "%s: limb '%s' positions match, but the bones are twisted %.1f° about "
+                "their own axes - usually twist posed on the FK upper bone, which "
+                "pole-target IK cannot reproduce. Untwist the FK bone or keep that "
+                "motion in FK" % (self.bl_label, limb.name, twist),
+            )
         else:
             self.report(
                 {'INFO'},
-                "%s: limb '%s' (residual %.5f)" % (self.bl_label, limb.name, deviation),
+                "%s: limb '%s' (residual %.5f, twist %.1f°)"
+                % (self.bl_label, limb.name, deviation, twist),
             )
         return {'FINISHED'}
 
@@ -289,7 +307,9 @@ class FKIK_OT_snap_ik_to_fk(SnapOperatorBase, bpy.types.Operator):
         knee_err = (ik_lower.matrix.translation - fk_lower.matrix.translation).length
         tip_err = ((ik_lower.matrix.translation + ik_lower.vector)
                    - (fk_lower.matrix.translation + fk_lower.vector)).length
-        return max(knee_err, tip_err)
+        twist_err = max(rotation_difference_deg(ik_upper, fk_upper),
+                        rotation_difference_deg(ik_lower, fk_lower))
+        return max(knee_err, tip_err), twist_err
 
 
 class FKIK_OT_snap_fk_to_ik(SnapOperatorBase, bpy.types.Operator):
@@ -314,6 +334,7 @@ class FKIK_OT_snap_fk_to_ik(SnapOperatorBase, bpy.types.Operator):
         context.view_layer.update()
 
         deviation = 0.0
+        twist_err = 0.0
         for fk_field, ik_field in (('fk_upper', 'ik_upper'), ('fk_lower', 'ik_lower')):
             fk_b, ik_b = bones[fk_field], bones[ik_field]
             deviation = max(
@@ -322,7 +343,8 @@ class FKIK_OT_snap_fk_to_ik(SnapOperatorBase, bpy.types.Operator):
                 ((fk_b.matrix.translation + fk_b.vector)
                  - (ik_b.matrix.translation + ik_b.vector)).length,
             )
-        return deviation
+            twist_err = max(twist_err, rotation_difference_deg(fk_b, ik_b))
+        return deviation, twist_err
 
 
 class FKIK_OT_calibrate_pole_angle(bpy.types.Operator):
